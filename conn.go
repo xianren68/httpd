@@ -38,13 +38,18 @@ func (c *conn) serve() {
 	}()
 	// http 长连接可能有多个请求，用for解析
 	for {
-		resp := setupResponse()
+		resp := setupResponse(c)
 		req, err := c.readRequest()
 		if err != nil {
 			handleErr(err, c)
+			return
 		}
 		// 用户自定义处理请求函数
 		c.svc.Handler.ServeHTTP(resp, req)
+		// 将缓冲区中数据全部刷新到tcp连接中
+		if err = c.bw.Flush(); err != nil {
+			return
+		}
 	}
 }
 
@@ -62,8 +67,4 @@ func handleErr(err error, c *conn) {
 func (c *conn) close() {
 	// 关闭tcp连接
 	_ = c.rwc.Close()
-}
-
-func setupResponse() *response {
-	return nil
 }

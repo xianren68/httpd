@@ -47,7 +47,7 @@ func (c *conn) serve() {
 		// 用户自定义处理请求函数
 		c.svc.Handler.ServeHTTP(resp, req)
 		// 将缓冲区中数据全部刷新到tcp连接中
-		if err = c.bw.Flush(); err != nil {
+		if err = req.finishRequest(); err != nil {
 			return
 		}
 	}

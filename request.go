@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,7 @@ type Request struct {
 	queryString map[string]string // 存储query参数
 }
 
+// readRequest 从tcp连接中读出request.
 func readRequest(conn *conn) (r *Request, err error) {
 	r = new(Request)
 	r.conn = conn
@@ -49,12 +51,16 @@ func readRequest(conn *conn) (r *Request, err error) {
 	if err != nil {
 		return
 	}
+	// 获取请求体时不再限制大小
+	const nolimit = (1 << 63) - 1
+	r.conn.lr.N = nolimit
 	// 设置请求体
 	r.setupBody()
+
 	return r, nil
 }
 
-// readline 读取一行数据
+// readline 读取一行数据.
 func readline(br *bufio.Reader) ([]byte, error) {
 	line, prefix, err := br.ReadLine()
 	if err != nil {
@@ -72,12 +78,12 @@ func readline(br *bufio.Reader) ([]byte, error) {
 	return line, err
 }
 
-// parseQuery 解析出query参数
+// parseQuery 解析出query参数.
 func (r *Request) parseQuery() {
 	r.queryString = parseQuery(r.URL.RawQuery)
 }
 
-// parseQuery 解析出query参数
+// parseQuery 解析出query参数.
 func parseQuery(RawQuery string) map[string]string {
 	splits := strings.Split(RawQuery, "&")
 	queries := make(map[string]string, len(splits))
@@ -92,7 +98,7 @@ func parseQuery(RawQuery string) map[string]string {
 	return queries
 }
 
-// readHeader 读取请求头
+// readHeader 读取请求头.
 func readHeader(br *bufio.Reader) (Header, error) {
 	header := make(Header)
 	for {
@@ -120,17 +126,35 @@ func readHeader(br *bufio.Reader) (Header, error) {
 
 type eofReader struct{}
 
-// 实现io.Reader接口
+// 实现io.Reader接口.
 func (er *eofReader) Read([]byte) (n int, err error) {
 	return 0, io.EOF
 }
 
-// setupBody 设置请求体
+// setupBody 设置请求体.
 func (r *Request) setupBody() {
-	r.Body = new(eofReader)
+	// 只有post和put请求携带结构体
+	if r.Method != "POST" && r.Method != "PUT" {
+		r.Body = &eofReader{}
+	} else if r.chunked() {
+		r.Body = &chunkReader{br: r.conn.br}
+		r.fixExpectContinueReader()
+	} else if cl := r.Header.Get("Content-Length"); cl != "" {
+		// 设置读取的最大长度
+		contentLength, err := strconv.ParseInt(cl, 10, 64)
+		if err != nil {
+			r.Body = &eofReader{}
+			return
+		}
+		r.Body = io.LimitReader(r.conn.br, contentLength)
+		r.fixExpectContinueReader()
+
+	} else {
+		r.Body = &eofReader{}
+	}
 }
 
-// Cookie 获取指定cookie值
+// Cookie 获取指定cookie值.
 func (r *Request) Cookie(name string) string {
 	// 将cookie解析置后，使用时才解析
 	if r.cookies == nil {
@@ -139,12 +163,12 @@ func (r *Request) Cookie(name string) string {
 	return r.cookies[name]
 }
 
-// Query 获取指定的query参数
+// Query 获取指定的query参数.
 func (r *Request) Query(name string) string {
 	return r.queryString[name]
 }
 
-// parseCookies 解析cookie
+// parseCookies 解析cookie.
 func (r *Request) parseCookies() {
 	if r.cookies != nil {
 		return
@@ -170,4 +194,52 @@ func (r *Request) parseCookies() {
 		}
 	}
 
+}
+
+// chunked 判断http协议是否使用chunk.
+func (r *Request) chunked() bool {
+	te := r.Header.Get("Transfer-Encoding")
+	return te == "chunked"
+}
+
+// expectContinueReader 用于处理有些请求需要100 continue字段才会继续发送body.
+type expectContinueReader struct {
+	// 判断是否已经发送过 100 continue
+	wroteContinue bool
+	r             io.Reader
+	w             *bufio.Writer
+}
+
+// Read 实现io.Reader.
+func (ex *expectContinueReader) Read(p []byte) (n int, err error) {
+	// 判断是否发送过 100 continue
+	if !ex.wroteContinue {
+		_, _ = ex.w.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+		_ = ex.w.Flush()
+		ex.wroteContinue = true
+	}
+	return ex.r.Read(p)
+}
+
+// fixExpectContinueReader 处理需要发送 100 continue 来继续接收请求体信息的连接.
+func (r *Request) fixExpectContinueReader() {
+	if r.Header.Get("Expect") != "100-continue" {
+		return
+	}
+	r.Body = &expectContinueReader{
+		r: r.Body,
+		w: r.conn.bw,
+	}
+}
+
+// finishRequest 一次请求后的收尾工作，防止影响后续请求
+func (r *Request) finishRequest() (err error) {
+	// 将缓冲区信息刷新到tcp连接中
+	err = r.conn.bw.Flush()
+	if err != nil {
+		return
+	}
+	// 将多余的请求体信息删除
+	_, err = io.Copy(io.Discard, r.Body)
+	return
 }
